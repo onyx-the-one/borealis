@@ -16,6 +16,9 @@ Three layers, each with its own name:
 
 Was called BTBX (Bare Tiny(?) BASIC eXecutor) until it stopped being tiny.
 
+### Reviewers and voter please read the README thoroughly before testing.
+The ship youre reviewing/voting on is almost a month old at this point and a lot has changed since. Please read carefully.
+
 ## Building
 
 Needs nasm, i686-elf-gcc, python3, qemu.
@@ -183,6 +186,19 @@ Raw filesystem, not partitioned - always `-i`, and use
   floppy boot. The USB driver above is the start of fixing that class.
 - The .inc dispatcher chain is brittle by construction (see The
   dispatcher). Cleanup debt.
+
+## Use of AI in this project
+
+This project is majority handwritten by me, me, and myself. However, I do use AI in these specific scenarios:
+
+- Local and global analysis for catching my errors, typos, etc
+- Local and global analysis for commenting and some documentation
+- Global analysis for debugging and research (which includes internet search)
+
+All of the above are done exclusively by a local LLM (usually some Gemma MoE).
+
+An outlier is the currently WIP USB driver, which is getting out of hand for me and therefore substantial changes to its code were made by AI. Still, any such code is thoroughly reviewed by my brain in cooperation with my eyes and fingers.
+Another is the demo site, due to the simple fact that I have no idea how to make that run. In full honesty, I barely even reviewed that code because how would I know what it says, as long as it works. I could've taken another 20 hours just to get it running but I believe this is a justified use for AI.
 
 ## Licence
 
