@@ -1,6 +1,6 @@
 # Borealis
 
-Version 1.8.64-pre43
+Version 1.8.65
 
 Borealis is an operating system built from scratch: its own bootloader,
 kernel, and language environment, with nothing underneath. It boots off
