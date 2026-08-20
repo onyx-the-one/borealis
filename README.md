@@ -1,275 +1,189 @@
 # Borealis
-**Version 1.8.0-pre43**
 
-Borealis is an operating system built from scratch: its own bootloader, kernel, and language environment, with no underlying OS. It boots directly from a FAT12 floppy image (or virtual floppy/HDD) and it *is* the OS. It fits entirely in conventional memory below 640 KB, requires no external runtime, and runs on real hardware or any BIOS-based emulator (QEMU, Bochs, VirtualBox in legacy mode, etc).
+Version 1.8.64-pre43
 
-It boots in BIOS real mode, switches to 32-bit protected mode, and drops straight into a line-numbered BASIC REPL with file I/O, arrays, sound, and (WIP) graphics. It is closer in spirit to a Commodore/Apple-era machine than to a modern OS.
+Borealis is an operating system built from scratch: its own bootloader,
+kernel, and language environment, with nothing underneath. It boots off
+a FAT12 floppy image (real or virtual), goes 32-bit, and drops you into
+a line-numbered BASIC REPL with file I/O, arrays, sound, and graphics.
+Closer to a Commodore-era machine than a modern OS.
 
-The system has three named layers:
+Three layers, each with its own name:
 
-- **coil** — the two-stage bootloader. Takes the machine from BIOS handoff to a loaded kernel.
-- **helix** — the kernel. Hardware bring-up, drivers, filesystem, and the real-mode BIOS thunk that bridges firmware services and protected-mode execution.
-- **BOREALIS** — the system as a whole; the user-facing name.
+- coil - the bootloader. Gets the machine from BIOS handoff to a loaded kernel.
+- helix - the kernel. Hardware bring-up, drivers, filesystem, the BIOS thunk.
+- BOREALIS - the whole thing, what you see.
 
-Formerly known as BTBX (Bare Tiny(?) BASIC eXecutor). Rename is still not complete, bear with me.
+Was called BTBX (Bare Tiny(?) BASIC eXecutor) until it stopped being tiny.
 
-## Table of contents
-- [Features](#features)
-- [Quick start](#quick-start)
-- [Boot process](#boot-process)
-- [Source layout](#source-layout)
-- [BASIC language reference](#basic-language-reference)
-- [Statements](#statements)
-- [Functions](#functions)
-- [Graphics](#graphics)
-- [Sound](#sound)
-- [File I/O](#file-io)
-- [Native code (BLOAD / SYS)](#native-code-bload--sys)
-- [Error messages](#error-messages)
-- [Memory map](#memory-map)
-- [Known issues / WIP](#known-issues--wip)
-- [Extracting files from the disk image](#extracting-files-from-the-disk-image)
-- [Version history](#version-history)
-- [Licence](#licence)
+## Building
 
-## Features
-| Area | Details |
-|---|---|
-| Interpreter | Line-numbered BASIC with GOTO, GOSUB/RETURN, FOR/NEXT, WHILE/WEND, IF/THEN/ELSE/ENDIF (block and inline), ON…GOTO/GOSUB |
-| Data types | Integer (32-bit), Float (x87 80-bit extended), String (256-char slots) |
-| Math | SIN COS TAN ATN EXP LOG SQR ABS INT FIX SGN RND CINT CDBL, all via x87 FPU |
-| Bitwise | AND OR XOR NOT SHL SHR, plus HEX$/BIN$ and &H/&B literals |
-| Strings | LEFT$ RIGHT$ MID$ STR$ CHR$ VAL ASC LEN, concatenation with + |
-| Arrays | Up to 3 dimensions, numeric and string, DIM required |
-| I/O | VGA 80×25 text, PS/2 keyboard, PRINT, INPUT, INKEY$ |
-| File I/O | FAT12 LOAD/SAVE/DIR, OPEN/CLOSE/PRINT#/INPUT# |
-| Memory | PEEK/POKE (raw 32-bit address) |
-| Sound | BEEP (PIT channel 2 square wave), SAY (SAM formant synthesis, 1-bit PWM, WIP) |
-| Graphics | SCREEN, PSET, LINE, RECT, CIRCLE, PALETTE, GCLS, POINT — mode 13h path currently semifunctional (faulting BIOS video-mode thunk) |
-| Native | BLOAD "file.bin",addr — load a raw flat binary; SYS addr — jump into it |
-| Boot | coil: two-stage loader (stage1 512B + stage2 2KB), BIOS CHS + EDD, A20 gate, real-mode-to-protected-mode handoff |
-| Tooling | NASM + i686-elf-gcc cross-compiler + Python mkfat.py |
+Needs nasm, i686-elf-gcc, python3, qemu.
 
-## Quick start
-```sh
-# Prerequisites: nasm, i686-elf-gcc (cross-compiler), python3, qemu
-make
-make run          # QEMU with SDL/GTK window
-```
+    make
+    make run
 
-`make` assembles the coil boot stages with NASM, compiles the helix kernel and BASIC interpreter with the i686-elf cross-compiler, links everything at 0x10000, and calls `mkfat.py` to stamp out a 1.44 MB FAT12 floppy image (`borealis.img`) with the kernel binary written to the boot-critical sectors. `make run` boots that image in QEMU.
-
-To boot on real hardware or in another emulator, write `borealis.img` to a floppy or USB stick and boot from it in legacy BIOS mode (no UEFI).
+`make` assembles coil, compiles helix + the interpreter, links at
+0x10000, and mkfat.py stamps out borealis.img (1.44 MB FAT12, kernel in
+the data area as a regular file starting at LBA 37). `make run` boots it
+in QEMU. For real hardware: dd the image to a stick, boot legacy BIOS
+(not UEFI). `make run-usb` is the USB development rig, see below.
 
 ## Boot process
-1. **stage1.asm** (512 bytes) — the MBR/VBR boot sector, the first stage of coil. BIOS loads this at `0x7C00` and jumps to it. It sets up a stack, reads stage2 from disk using BIOS CHS/EDD, and jumps to it.
-2. **stage2.asm** (2 KB) — enables the A20 line, sets up a GDT, switches the CPU into 32-bit protected mode, loads the helix kernel image from disk, and jumps into the kernel entry point.
-3. **entry.asm** — the 32-bit kernel entry. Copies the `thunk16` real-mode trampoline blob to `0x7100` (needed so 32-bit code can still call BIOS interrupts for disk I/O), sets up the C runtime stack, and calls `kernel_main`.
-4. **kernel.c** — brings up the VGA text terminal and PS/2 keyboard, prints the boot banner, and hands off to the BASIC interpreter's REPL loop.
-5. **basic.c** — the interpreter itself. From here on, everything is BASIC.
 
-The disk-access real-mode thunk (`thunk16.asm`, running at `0x7100`) is what lets 32-bit protected-mode code still issue BIOS `INT 13h` disk calls: it briefly drops back to real mode, does the BIOS call, and returns to protected mode. This is why FAT12 LOAD/SAVE/BLOAD all work reliably even though helix itself runs in 32-bit mode. Video mode switching does **not** have an equivalent thunk implemented yet; see [Known issues](#known-issues--wip).
+1. stage1.asm (512 bytes) - the boot sector. BIOS puts it at 0x7C00. It
+   loads stage2 via CHS and jumps.
+2. stage2.asm (2 KB) - A20, GDT, picks a working disk geometry by
+   *verifying* (reads the first kernel sector and checksums it against a
+   build-time constant; EDD first, then a brute-force CHS candidate
+   list), loads the kernel one sector per int 13h call, checksums the
+   whole image before jumping. A bad read can never present as a
+   mysterious reset anymore.
+3. entry.asm - 32-bit entry. Copies the thunk16 real-mode trampoline to
+   0x7100, sets up the C stack, calls kernel_main.
+4. helix.c - VGA terminal, keyboard, banner, then the REPL.
 
-## Source layout
-```
-borealis/
-├── coil/                   the bootloader
-│   ├── stage1.asm          512-byte MBR/VBR boot sector
-│   └── stage2.asm          2 KB second-stage loader (pmode, EDD, A20)
-├── src/helix/              the kernel
-│   ├── entry.asm           32-bit kernel entry; copies thunk16 blob
-│   ├── basic.h             API (VGA colours, terminal, kernel)
-│   ├── basic.c             BASIC interpreter (lexer, parser, evaluator, REPL)
-│   ├── kernel.c            VGA terminal, PS/2 keyboard, banner, kernel_main
-│   ├── stmt/
-│   │   ├── core.inc        startup, DIM, POKE, LET/assignment
-│   │   ├── console.inc     PRINT, INPUT, DATA, READ, RESTORE
-│   │   ├── flow.inc        GOTO/GOSUB/RETURN, FOR/NEXT, WHILE/WEND, IF/ELSE/ENDIF, ON
-│   │   ├── file.inc        OPEN/CLOSE, PRINT#/INPUT#, DIR, LOAD, SAVE
-│   │   ├── graphics.inc    SCREEN, PSET, LINE, RECT, CIRCLE, PALETTE, GCLS
-│   │   └── system.inc      BEEP, SAY, BLOAD, SYS, HELP, fallback
-│   ├── fs/
-│   │   ├── fat12.h
-│   │   ├── fat12.c         FAT12 read/write via real-mode BIOS thunk
-│   │   └── thunk16.asm     Real-mode BIOS trampoline at 0x7100
-│   ├── gfx/
-│   │   ├── gfx.h
-│   │   └── gfx.c           VGA mode 13h primitives (pixel, line, rect, circle)
-│   └── sound/
-│       ├── sound.h
-│       └── sound.c         BEEP (PIT ch2) + SAM speech (WIP) (1-bit PWM)
-├── linker.ld               Kernel linked at 0x10000
-├── mkfat.py                Builds borealis.img (1.44 MB FAT12)
-├── Makefile
-├── LICENSE                 MIT
-└── README.md
-```
+The thunk (thunk16.asm at 0x7100) is how 32-bit helix still issues int
+13h disk calls and int 10h video mode switches: drop to real mode, do
+the call, come back. Both directions are instrumented with checkpoint
+letters, which is how a hang names its own location.
 
-The statement dispatcher in `basic.c` is assembled from the `.inc` fragments above via `#include`, in the order `core.inc → flow.inc → console.inc → file.inc → graphics.inc → system.inc`. **Include order is semantically significant**: earlier fragments can shadow keywords that later fragments also try to handle (this bit us once with `PRINT#`/`INPUT#`, now fixed). Anyone adding a new statement keyword should check for collisions across all `.inc` files before picking where it lives.
+## The dispatcher
 
-## BASIC language reference
-
-### Program structure
-Every line starts with a line number. Line numbers can be entered in any order; Borealis keeps the program sorted internally.
-
-```basic
-10 PRINT "Hello, world!"
-20 FOR I = 1 TO 10
-30   PRINT I
-40 NEXT I
-50 END
-```
-
-Commands typed without a leading line number execute immediately (direct mode) instead of being stored.
-
-### Data types
-- **Integer** — 32-bit signed.
-- **Float** — x87 80-bit extended precision, used automatically for any expression involving a decimal point, or the result of SIN/COS/SQR/etc.
-- **String** — up to 256 characters per slot, denoted with a trailing `$` on variable and function names (e.g. `N$`, `LEFT$`). Type is inferred by the trailing `$` on the variable name; there's no separate DIM-time type declaration beyond that.
+basic.c's statement parser is assembled from .inc fragments via
+#include, in order core, console, flow, file, system, graphics. Include
+order is semantic - an earlier fragment can shadow a keyword a later one
+also wants (this actually bit us with PRINT#/INPUT#). Only basic.c owns
+the catch-all berr("WHAT?"); no .inc may have its own. If you chain kw()
+calls you must call sw() between them yourself - kw() doesn't skip
+whitespace after a match. These are learned-the-hard-way rules.
 
 ## Statements
+
 | Statement | Syntax | Notes |
 |---|---|---|
-| PRINT | `PRINT expr, expr, ...` | Comma-separated list; trailing `;` suppresses the newline (console form) |
-| PRINT# | `PRINT #n, expr, ...` | Writes to open file channel n |
-| INPUT | `INPUT "prompt", var` | Console input |
-| INPUT# | `INPUT #n, var` | Reads from open file channel n |
-| LET | `LET var = expr` or bare `var = expr` | Both forms are independent code paths — see the note in Source layout |
-| DIM | `DIM name(d1)`, `DIM name(d1,d2)`, `DIM name(d1,d2,d3)` | Up to 3 dimensions, numeric or string (`name$`) |
-| REM | `REM comment` | Full-line comment |
-| IF | Inline: `IF expr THEN stmt` — Block: `IF expr THEN ... ELSE ... ENDIF` | Inline form does nothing on false; block form requires ENDIF |
-| GOTO | `GOTO n` | Jump to line n |
-| GOSUB / RETURN | `GOSUB n` ... `RETURN` | Subroutine call/return by line number |
-| ON | `ON expr GOTO n1,n2,...` or `ON expr GOSUB n1,n2,...` | Computed branch |
-| FOR / NEXT | `FOR v = start TO end [STEP s]` ... `NEXT v` | NEXT searches the FOR stack by variable name, so GOTO out of a nested loop is safe |
-| WHILE / WEND | `WHILE expr` ... `WEND` | |
-| DATA / READ / RESTORE | `DATA v1,v2,...` / `READ var` / `RESTORE` | Classic DATA-statement queue |
-| POKE | `POKE addr, value` | Raw memory write |
-| OPEN / CLOSE | `OPEN "file" FOR INPUT|OUTPUT AS n` / `CLOSE n` | FAT12-backed file channel |
-| SAVE / LOAD | `SAVE "prog.bas"` / `LOAD "prog.bas"` | Save/load the current program |
-| DIR | `DIR` | List files on disk |
-| NEW | `NEW` | Clear the current program from memory |
-| RUN | `RUN` | Execute the current program from the first line |
-| LIST | `LIST` | Print the current program |
-| END | `END` | Stop execution |
-| HALT | `HALT` | Stop execution (alias) |
-| CLEAR | `CLEAR` | Reset variables |
-| BEEP | `BEEP freq, ms` | PIT square-wave tone |
-| SAY | `SAY strexpr` | SAM formant speech synth — WIP, currently non-functional |
-| SCREEN | `SCREEN mode` | Switch video mode — currently broken, see Known issues |
-| PSET | `PSET x, y, c` | Plot a pixel |
-| LINE | `LINE x0,y0,x1,y1,c` | Draw a line |
-| RECT | `RECT x0,y0,x1,y1,c[,F]` | Draw a rectangle; `F` fills it |
-| CIRCLE | `CIRCLE x,y,r,c[,F]` | Draw a circle; `F` fills it |
-| PALETTE | `PALETTE i,r,g,b` | Set a VGA palette entry |
-| GCLS | `GCLS c` | Clear the graphics screen to colour c |
-| BLOAD | `BLOAD "file.bin", addr` | Load a raw binary into memory |
-| SYS | `SYS addr` | Jump into machine code at addr |
-| HELP | `HELP` | Print the built-in command reference |
+| PRINT | `PRINT expr, expr, ...` | trailing `;` suppresses newline |
+| PRINT# / INPUT# | `PRINT #n, expr` / `INPUT #n, var` | file channel n |
+| INPUT | `INPUT "prompt", var` | |
+| LET | `LET var = expr` or bare `var = expr` | two separate parse paths, keep them that way |
+| DIM | `DIM name(d1[,d2[,d3]])` | up to 3 dims, string arrays via `name$` |
+| REM | `REM ...` | |
+| IF | inline `IF e THEN stmt`, block `IF e THEN ... ELSE ... ENDIF` | inline false does nothing; block needs ENDIF |
+| GOTO / GOSUB / RETURN | line numbers | |
+| ON | `ON expr GOTO n1,n2,...` (or GOSUB) | |
+| FOR / NEXT | `FOR v = a TO b [STEP s]` | NEXT searches the FOR stack by name, so GOTO out of a nested loop is safe |
+| WHILE / WEND | | |
+| DATA / READ / RESTORE | | |
+| POKE / PEEK | `POKE addr, value` | raw 32-bit memory |
+| OPEN / CLOSE | `OPEN "file" FOR INPUT|OUTPUT AS n` | |
+| SAVE / LOAD / DIR | the current program, and the root dir | |
+| NEW / RUN / LIST / END / HALT / CLEAR | | |
+| BEEP | `BEEP freq, ms` | PIT ch2 square wave |
+| SAY | `SAY s$` | SAM formant synth, 1-bit PWM. WIP, sounds wrong |
+| SCREEN / PSET / LINE / RECT / CIRCLE / PALETTE / GCLS / POINT | mode 13h | work; SCREEN goes through thunk opcode 6 |
+| BLOAD / SYS | `BLOAD "file.bin", addr` / `SYS addr` | flat binaries, see below |
+| HELP | | |
 
-## Functions
+Functions: SIN COS TAN ATN EXP LOG SQR ABS INT FIX SGN RND CINT CDBL
+(all x87), AND OR XOR NOT SHL SHR, HEX$ BIN$ and &H/&B literals,
+LEFT$ RIGHT$ MID$ STR$ CHR$ VAL ASC LEN, INKEY$, DATE$, TIME$.
 
-### Math
-`SIN COS TAN ATN EXP LOG SQR ABS INT FIX SGN RND CINT CDBL`
+Data types: 32-bit int, x87 80-bit float, strings up to 256 chars
+(trailing `$`). Arrays need DIM.
 
-### Bitwise / numeric base
-`AND OR XOR NOT SHL SHR` (as binary/unary operators), `HEX$(n)`, `BIN$(n)`, and literals `&Hff`, `&B1010`
+## Config and the boot log
 
-### Strings
-`LEFT$(s,n) RIGHT$(s,n) MID$(s,start[,len]) STR$(n) CHR$(n) VAL(s$) ASC(s$) LEN(s$)`
+CONFIG.TXT on the boot disk, key=value, one per line. Leading line
+numbers are tolerated so `EDIT CONFIG.TXT` just works. Keys: SPLASH
+(run SPLASH.BAS at boot, default 1) and LOG (boot debug log, default 1).
 
-### Misc
-`PEEK(addr)`, `POINT(x,y)` (reads a pixel), `INKEY$` (non-blocking single-key read, returns empty string if nothing pending), `DATE$`, `TIME$`
+With LOG=1: everything from the first instruction on (asm checkpoints,
+the thunk letters, all [DEBUG] lines) is captured into a buffer. Once
+the filesystem proves it can write, the buffer becomes LOG.TXT and the
+screen clears to the banner. If the fs write fails, echo was never
+turned off, so the whole log is already on screen - the fallback isn't a
+code path, it's the default. `klog()` appends post-boot. LOG.TXT is
+overwritten each boot and readable without booting: `mcopy -i
+borealis.img ::LOG.TXT .`
 
-## Graphics
-Borealis targets VGA mode 13h (320×200, 256 colours) with a small primitive set: `PSET`, `LINE`, `RECT`, `CIRCLE`, `PALETTE`, `GCLS`, and the `POINT()` read-back function, all implemented in `gfx.c`/`gfx.h` and exposed via `graphics.inc`.
+## Native code
 
-**Currently broken:** `SCREEN mode` calls `bios_set_video_mode()`, which needs a real-mode BIOS `INT 10h` thunk analogous to the disk-I/O thunk in `thunk16.asm`. That thunk does not exist yet, so mode switching silently does nothing (or hangs, depending on emulator). Until it's implemented, don't rely on `SCREEN`/graphics commands in shipped BASIC programs. Write text-mode-only programs instead, using direct VGA text-buffer access (`0xB8000`) and BIOS keyboard ports if you need something snappier than PRINT (see the demo game for an example of this approach via BLOAD/SYS).
+Drop a flat binary on the disk, then:
 
-## Sound
-`BEEP freq, ms` drives PIT channel 2 as a PC-speaker square wave and is fully working. `SAY strexpr` is a port of the SAM (Software Automatic Mouth) formant synthesizer feeding a 1-bit PWM buffer through PIT channel 0; it's included but currently does not produce correct output. Treat it as WIP.
+    BLOAD "DEMO.BIN", 131072
+    SYS 131072
 
-## File I/O
-FAT12 read/write goes through the real-mode BIOS disk thunk, so it works identically whether Borealis is running under QEMU or on real hardware booted from the same image.
+Load ceiling is 0x7F000 (stay clear of VGA at 0xA0000). Rules: raw
+binary (objcopy -O binary), entry point must be the first byte (control
+section order in your linker script, compilers don't guarantee function
+order), nobody zeroes your .bss for you. If your code returns instead of
+halting you fall back into the REPL, which looks like BASIC printing a
+prompt out of nowhere. 0x20000 is a sane scratch address.
 
-```basic
-OPEN "DATA.TXT" FOR OUTPUT AS 1
-PRINT #1, "hello"
-CLOSE 1
+## USB
 
-OPEN "DATA.TXT" FOR INPUT AS 1
-INPUT #1, A$
-CLOSE 1
-```
+There's a native USB mass-storage driver in progress. Motivation: on at
+least one real BIOS (Core 2 Duo laptop), int 13h dies after the CPU has
+been in protected mode - even a no-transfer disk reset never returns -
+because legacy USB on that machine is SMM and the trap mishandles the
+post-PM state. Coil still boots via BIOS (that path is pure real mode
+and works), helix takes over natively.
 
-`SAVE`/`LOAD` persist the current BASIC program itself to/from disk. `DIR` lists the FAT12 root directory.
-
-## Native code (BLOAD / SYS)
-Borealis supports a classic home-computer workflow: drop a flat binary on the disk, load it into memory, and jump into it directly from BASIC.
-
-```basic
-BLOAD "DEMO.BIN", 131072
-SYS 131072
-```
-
-`BLOAD` parses the filename, converts it to FAT 8.3 format, and loads it directly to the given physical address via the FAT12 driver. The load ceiling is `0x7F000` (BLOAD refuses to load past this, to stay clear of VGA memory at `0xA0000`). `SYS` evaluates its address expression, casts it to a `void (*)(void)`, and calls it. Execution transfers directly into your machine code with no sandboxing whatsoever.
-
-Requirements for a binary to work correctly with SYS:
-- It must be a flat raw binary (`objcopy -O binary`), not an ELF file.
-- Its true entry point must be the very first byte at the load address. Control the section order explicitly in your linker script (e.g. a dedicated `.text.start` section placed before generic `.text`), since compilers don't guarantee function emission order.
-- It should not rely on a zeroed `.bss`. Nothing clears memory before `SYS` jumps in; avoid static/global variables that expect zero-initialization, or zero them yourself at the top of your entry function.
-- If it returns instead of halting, control falls back into the BASIC REPL, which will look like BASIC printing a blank prompt line out of nowhere. If you don't want that, put an infinite `hlt` loop at the end of your entry function.
-- 0x20000 is a reasonable scratch load address given the current kernel layout (helix lives at 0x10000, BLOAD's ceiling is 0x7F000).
-
-## Error messages
-Borealis reports errors in light red text on the console and halts execution of the current program. Errors you may encounter:
-
-| Error | Meaning |
-|---|---|
-| SYNTAX | Parser couldn't make sense of the statement |
-| MEM | Out of string pool / variable table / program line slots |
-| DIV0 | Division by zero |
-| SUBSCRIPT | Array index out of bounds |
-| TYPE MISMATCH | Mixed numeric/string operation where it isn't allowed |
-| MATH | Invalid argument to a math function (e.g. SQR of a negative number, LOG of zero) |
-| RTC | Real-time clock read failure |
-| FILE NOT FOUND | BLOAD/LOAD target doesn't exist on disk |
-| DISK NOT READY | FAT12 driver couldn't access the disk |
-| UNKNOWN FUNCTION | Called a function name the interpreter doesn't recognize |
+Layers, each independently instrumented: PCI scan finds the EHCI
+controller by class code, the BIOS/SMM ownership handoff (EECP
+semaphore, then kill every legacy SMI source), EHCI init with an idle
+async schedule, port scan/reset, EP0 control transfers, BOT/SCSI (TEST
+UNIT READY, INQUIRY, READ CAPACITY, READ/WRITE(10)) surfacing as one-
+sector read/write. When usb_probe() succeeds, fat12's disk backend
+switches from the BIOS thunk to the stick and stops caring what a disk
+is. Polled, no interrupts, no periodic schedule. Works in QEMU
+(`make run-usb`); the laptop port-reset is the remaining real-hardware
+bug.
 
 ## Memory map
+
 | Range | Contents |
 |---|---|
-| `0x7C00` | coil stage1 boot sector (loaded here by BIOS) |
-| `0x7100` | thunk16 real-mode BIOS trampoline |
-| `0x10000` | helix entry point (linked address, see linker.ld) |
-| `0x20000` | Suggested scratch address for BLOAD/SYS user binaries |
-| `0x7F000` | BLOAD load ceiling |
-| `0xA0000` | VGA graphics memory (mode 13h framebuffer) |
-| `0xB8000` | VGA text-mode buffer (80×25, 16-bit cells: attribute + char) |
+| 0x7C00 | coil stage1 (BIOS puts it here) |
+| 0x7100 | thunk16 trampoline |
+| 0x77F0 | debug-log control block (see logmem.inc) |
+| 0x7800 | asm-side trace buffer |
+| 0x10000 | helix entry (linker.ld) |
+| 0x20000 | scratch for BLOAD/SYS |
+| 0x7F000 | BLOAD ceiling |
+| 0xA0000 | VGA framebuffer (mode 13h) |
+| 0xB8000 | VGA text buffer |
+| 0x100000 | helix BSS starts here |
+
+## Errors
+
+SYNTAX, MEM, DIV0, SUBSCRIPT, TYPE MISMATCH, MATH, RTC, FILE NOT FOUND,
+DISK NOT READY, UNKNOWN FUNCTION. Light red on the console, halts the
+current program.
+
+## mtools
+
+borealis.img is a plain FAT12 floppy filesystem, so mtools reads and
+writes it without booting:
+
+    mdir -i borealis.img
+    mcopy -i borealis.img ::PRIMES.TXT ./primes_result.txt
+    mcopy -i borealis.img PONG.BIN ::PONG.BIN
+
+Raw filesystem, not partitioned - always `-i`, and use
+`MTOOLS_SKIP_CHECK=1` if it complains about geometry.
 
 ## Known issues / WIP
-- `SCREEN`/graphics commands don't work: no BIOS video-mode real-mode thunk exists yet, only the disk-I/O thunk is implemented. This is the top priority for the graphics subsystem.
-- `SAY` (SAM speech synth) is ported but not producing correct audio output yet.
-- The statement dispatcher is a long ordered chain of keyword checks across included `.inc` fragments rather than a structured dispatch table. Include order matters, and new keywords must be checked against all fragments for shadowing conflicts.
-- No timer/IRQ-driven scheduling. BEEP/delay loops that need real elapsed time should use the PIT-tick technique in `sound.c` rather than a CPU spin loop, since spin loops scale with CPU/emulator speed and are not portable.
-- No native floppy controller driver: all disk access goes through the BIOS real-mode thunk, so it won't work in an environment without BIOS INT 13h (e.g. pure UEFI with CSM disabled).
 
-## Extracting files from the disk image
-`mkfat.py` builds a standard FAT12 floppy filesystem, so files written by Borealis (or files you want to inject before boot, like a compiled BLOAD binary) can be read/written with `mtools` without booting the image at all.
-
-```sh
-# list contents
-mdir -i borealis.img
-
-# copy a file out
-mcopy -i borealis.img ::PRIMES.TXT ./primes_result.txt
-
-# copy a file in
-mcopy -i borealis.img PONG.BIN ::PONG.BIN
-```
-
-Because this is a raw floppy filesystem and not a partitioned disk image, always pass `-i` to point mtools at the image directly. If mtools complains about geometry, set `MTOOLS_SKIP_CHECK=1` before the command.
+- SAY is ported but doesn't produce correct audio.
+- No timer IRQ; anything needing real elapsed time should use the PIT
+  (timer.h reads channel 0's count, works in any CPU mode, needs no
+  interrupts).
+- No native floppy driver yet; BIOS int 13h is still the disk path on
+  floppy boot. The USB driver above is the start of fixing that class.
+- The .inc dispatcher chain is brittle by construction (see The
+  dispatcher). Cleanup debt.
 
 ## Licence
-MIT — see `LICENSE`.
+
+MIT - see LICENSE.

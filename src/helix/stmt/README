@@ -1,5 +1,0 @@
-- core.inc: startup/system basics, DIM, POKE, LET/assignment
-- console.inc: PRINT, INPUT, DATA, READ, RESTORE
-- flow.inc: GOTO/GOSUB/RETURN, FOR/NEXT, WHILE/WEND, IF/ELSE/ENDIF, ON
-- file.inc: OPEN/CLOSE, PRINT#/INPUT#, DIR, LOAD, SAVE
-- system.inc: BEEP, SAY, BLOAD, SYS, HELP, fallback WHAT

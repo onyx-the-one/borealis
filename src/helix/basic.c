@@ -3,6 +3,7 @@
 #include "sound/sound.h"
 #include "rtc/rtc.h"
 #include "gfx/gfx.h"
+#include "config.h"
 
 /* ── x87 math helpers ────────────────────────────────────────────── */
 static double x87sin(double x){double r;__asm__("fsin":"=t"(r):"0"(x));return r;}
@@ -111,7 +112,7 @@ static char fbuf[MAXLINES*LINELEN];
 #define IBUF 256
 typedef struct{char var[NAMELEN];Val lim,step;int ret;}ForFrame;
 typedef struct{int ret;}WhileFrame;
-static int pc=0,running=0,err=0;
+int pc=0,running=0,err=0;
 static int cstk[CALLDEPTH];
 static int csp=0;
 static ForFrame fstk[FORDEPTH];
@@ -123,7 +124,7 @@ static const char *pp;
 static int dataline=0,datacol=0;
 
 static void sw(void){while(*pp==' ')pp++;}
-static void berr(const char *m){if(err)return;err=1;running=0;term_set_color(VGA_LIGHT_RED,VGA_BLACK);term_puts("? ");term_puts(m);term_putchar('\n');term_set_color(VGA_LIGHT_GREY,VGA_BLACK);}
+static void berr(const char *m){if(err)return;err=1;running=0;term_set_color(VGA_LIGHT_RED,VGA_BLACK);term_puts("? ");term_puts(m);term_putchar('\n');term_set_color(VGA_LIGHT_GREY,VGA_BLACK);klog(m);}
 static int kw(const char *k){const char *ppp=pp;while(*k){char a=*pp,b=*k;if(a>='a'&&a<='z')a-=32;if(a!=b){pp=ppp;return 0;}pp++;k++;}char nx=*pp;if((nx>='A'&&nx<='Z')||(nx>='a'&&nx<='z')||(nx>='0'&&nx<='9')||nx=='_'){pp=ppp;return 0;}return 1;}
 static int readname(char *out,int max){sw();char c=*pp;if(!((c>='A'&&c<='Z')||(c>='a'&&c<='z')))return 0;int i=0;while((*pp>='A'&&*pp<='Z')||(*pp>='a'&&*pp<='z')||(*pp>='0'&&*pp<='9')||*pp=='_'){char ch=*pp++;if(ch>='a'&&ch<='z')ch-=32;if(i<max-2)out[i++]=ch;}if(*pp=='$'&&i<max-1)out[i++]=*pp++;out[i]=0;return i>0;}
 static Val expr(void);
@@ -334,7 +335,7 @@ static void prog_from_buf(char *buf){
     }
 }
 
-static int prog_load_name11(const char nm11[12]){
+int prog_load_name11(const char nm11[12]){
     if(!fat_ready())return -2;
     int n=fat_load(nm11,fbuf,(int)sizeof(fbuf)-1);
     if(n<=0)return -1;
@@ -550,14 +551,23 @@ static int maybe_edit(const char *line){
 
 /* ── Statement dispatcher ────────────────────────────────────────── */
 static void stmt(const char *line);
-static void stmt(const char *line){
+
 #include "stmt/core.inc"
 #include "stmt/console.inc"
 #include "stmt/flow.inc"
 #include "stmt/file.inc"
 #include "stmt/system.inc"
 #include "stmt/graphics.inc"
-berr("WHAT?");
+
+static int (*const stmt_frag[])(void)={
+    stmt_core,stmt_console,stmt_flow,stmt_file,stmt_system,stmt_graphics
+};
+
+static void stmt(const char *line){
+    pp=line;sw();if(!*pp)return;
+    for(unsigned i=0;i<sizeof(stmt_frag)/sizeof(stmt_frag[0]);i++)
+        if(stmt_frag[i]())return;
+    berr("WHAT?");
 }
 
 /* ── REPL ────────────────────────────────────────────────────────── */
@@ -570,10 +580,11 @@ void basic_run(void){
             err=0;continue;
         }
         term_sync_cursor();
-        term_set_color(VGA_LIGHT_GREEN,VGA_BLACK);term_puts("BTBX");
+        term_set_color(VGA_LIGHT_GREEN,VGA_BLACK);term_puts("=");
         term_set_color(VGA_DARK_GREY,VGA_BLACK);term_puts("> ");
         term_set_color(VGA_WHITE,VGA_BLACK);term_getline(ibuf,IBUF);upr(ibuf);
         const char *p=ibuf;while(*p==' ')p++;if(!*p)continue;
+		klog(p);
         if(*p>='0'&&*p<='9'){
             int n=0;while(*p>='0'&&*p<='9')n=n*10+(*p++-'0');
             if(n<1||n>65535){berr("BAD LINE NUMBER");continue;}

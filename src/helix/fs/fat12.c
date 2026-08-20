@@ -1,25 +1,7 @@
 #include "fat12.h"
-#include "basic.h"   /* DEBUG: needed for term_puts()/term_puti() instrumentation below */
+#include "log.h"
+#include "usb_msd.h"
 #include <stdint.h>
-
-/* DEBUG: helper to print an unsigned byte/dword as 2/8 hex digits.
- * Used everywhere below to report drive numbers, LBAs, sector counts
- * and error codes exactly as the BIOS reported them -- so a failure
- * report always carries enough detail to reproduce/diagnose it
- * without needing to re-instrument anything. Kept static/local to
- * this file to avoid touching the public terminal API in basic.h. */
-static void dbg_hex8(uint8_t v){
-    const char *hexd = "0123456789ABCDEF";
-    term_putchar(hexd[(v >> 4) & 0xF]);
-    term_putchar(hexd[v & 0xF]);
-}
-
-static void dbg_hex32(uint32_t v){
-    const char *hexd = "0123456789ABCDEF";
-    for(int shift = 28; shift >= 0; shift -= 4){
-        term_putchar(hexd[(v >> shift) & 0xF]);
-    }
-}
 
 #define SPT            18
 #define HEADS          2
@@ -62,49 +44,50 @@ extern uint8_t bios_disk_thunk(uint8_t drive, uint8_t head, uint8_t sector,
                                uint8_t use_edd, uint32_t lba_lo);
 extern uint8_t bios_get_geometry(uint8_t drive, uint8_t *spt_out, uint8_t *heads_out);
 
-/* NOTE: EDD (int 13h ah=41h presence-check AND ah=42h extended read)
- * has been confirmed to hang indefinitely on at least one real BIOS
- * (Core 2 Duo era laptop), even though plain legacy CHS (ah=02h/03h)
- * works fine on that same machine. EDD is therefore disabled
- * permanently here rather than probed for -- we always use CHS, but
- * we ask the BIOS for its *real* geometry (ah=08h) instead of
- * assuming floppy geometry (18 SPT / 2 heads), since that assumption
- * is wrong for USB/HDD-style boot media and would silently read the
- * wrong sectors. If the geometry query itself fails, we fall back to
- * the floppy defaults as a last resort. */
+/* Disk backend selection (corrects the stale note this replaces):
+   EDD works fine on the laptop FROM BOOT-TIME REAL MODE -- coil loads
+   the kernel through it. What hangs on that machine is ANY int 13h
+   from the post-PM thunk, CHS or EDD alike, even a no-transfer ah=00h
+   reset (SMM legacy USB suspect). So helix trusts the coil-verified
+   stash at 0x0601/0x0602: EDD when coil booted via EDD, coil CHS
+   geometry when it booted via CHS, floppy defaults only if the stash
+   is empty. The native USB stack in usb/ replaces this whole backend. */
 static void disk_init_backend(uint8_t drive){
+if(usb_msd_ready()){
+g_disk.drive = drive;
+log_puts("[DEBUG fat12: backend = native USB mass storage]\n");
+return;
+}
     g_disk.drive = drive;
     g_disk.use_edd = 0;
     g_disk.spt = SPT;
     g_disk.heads = HEADS;
 
-    /* DEBUG: entering disk backend init */
-    term_puts("[DEBUG fat12: disk_init_backend drive=0x");
-    dbg_hex8(drive);
-    term_puts("]\n");
+    uint8_t coil_spt = *(volatile uint8_t *)0x0601;
+    uint8_t coil_heads = *(volatile uint8_t *)0x0602;
 
-    if(drive >= 0x80){
-        uint8_t spt = 0, heads = 0;
-        uint8_t st = bios_get_geometry(drive, &spt, &heads);
+    log_puts("[DEBUG fat12: disk_init_backend drive=0x");
+    log_hex8(drive);
+    log_puts(" coil_mode=");
+    log_puts(coil_spt ? "chs" : "edd");
+    log_puts("]\n");
 
-        /* DEBUG: report exactly what the BIOS gave us (or didn't) */
-        term_puts("[DEBUG fat12: bios_get_geometry status=0x");
-        dbg_hex8(st);
-        term_puts(" spt=");
-        term_puti(spt);
-        term_puts(" heads=");
-        term_puti(heads);
-        term_puts("]\n");
+    if(drive >= 0x80 && coil_spt == 0){
+        g_disk.use_edd = 1;
+        log_puts("[DEBUG fat12: using EDD/LBA backend (coil-verified)]\n");
+        return;
+    }
 
-        if(!st && spt && heads){
-            g_disk.spt = spt;
-            g_disk.heads = heads;
-            term_puts("[DEBUG fat12: using BIOS-reported CHS geometry]\n");
-        } else {
-            term_puts("[DEBUG fat12: WARNING geometry query failed or returned zero -- falling back to floppy defaults SPT=18 HEADS=2, disk reads WILL be wrong if this drive is not a real floppy]\n");
-        }
+    if(coil_spt){
+        g_disk.spt = coil_spt;
+        g_disk.heads = coil_heads;
+        log_puts("[DEBUG fat12: using coil-verified CHS geometry spt=");
+        log_puti(coil_spt);
+        log_puts(" heads=");
+        log_puti(coil_heads);
+        log_puts("]\n");
     } else {
-        term_puts("[DEBUG fat12: drive < 0x80, assuming floppy geometry SPT=18 HEADS=2]\n");
+        log_puts("[DEBUG fat12: WARNING no coil geometry, falling back to floppy defaults SPT=18 HEADS=2]\n");
     }
 }
 
@@ -115,6 +98,7 @@ static void disk_lba_to_chs(uint32_t lba, uint8_t *cyl, uint8_t *head, uint8_t *
 }
 
 static int disk_xfer_one(int is_write, uint32_t lba, uint32_t buf_phys){
+if(usb_msd_ready()) return usb_msd_xfer(is_write, lba, buf_phys);
     uint8_t cyl = 0, head = 0, sec = 0;
     uint8_t op;
     uint8_t *bounce = BOUNCE_PTR;
@@ -128,32 +112,27 @@ static int disk_xfer_one(int is_write, uint32_t lba, uint32_t buf_phys){
         for(int i=0;i<SECTOR_SZ;i++) bounce[i] = user[i];
     }
 
-    uint8_t st = bios_disk_thunk(g_disk.drive, head, sec, cyl, 1, BOUNCE_PHYS, op, lba);
+    uint8_t st = bios_disk_thunk(g_disk.drive, head, sec, cyl, 1,
+                                 BOUNCE_PHYS, op, lba);
     if(st){
-        /* DEBUG: this is the single most important error message in
-         * the whole disk stack -- every failed sector read/write
-         * bottoms out here. Always report LBA + CHS + status so a
-         * failure can be traced back to the exact sector involved. */
-        term_puts("[DEBUG fat12: DISK ");
-        term_puts(is_write ? "WRITE" : "READ");
-        term_puts(" FAILED lba=0x");
-        dbg_hex32(lba);
-        term_puts(" chs=(c=");
-        term_puti(cyl);
-        term_puts(",h=");
-        term_puti(head);
-        term_puts(",s=");
-        term_puti(sec);
-        term_puts(") status=0x");
-        dbg_hex8(st);
-        term_puts("]\n");
+        log_puts("[DEBUG fat12: DISK ");
+        log_puts(is_write ? "WRITE" : "READ");
+        log_puts(" FAILED lba=0x");
+        log_hex32(lba);
+        log_puts(" chs=c");
+        log_puti(cyl);
+        log_puts(",h");
+        log_puti(head);
+        log_puts(",s");
+        log_puti(sec);
+        log_puts(" status=0x");
+        log_hex8(st);
+        log_puts("]\n");
         return -1;
     }
-
     if(!is_write){
         for(int i=0;i<SECTOR_SZ;i++) user[i] = bounce[i];
     }
-
     return 0;
 }
 
@@ -161,9 +140,9 @@ static int disk_read_lba(uint32_t lba, uint16_t count, uint32_t buf_phys){
     while(count){
         if(disk_xfer_one(0, lba, buf_phys)){
             /* DEBUG: propagate exactly where in a multi-sector read it broke */
-            term_puts("[DEBUG fat12: disk_read_lba aborted, sectors_remaining=");
-            term_puti(count);
-            term_puts("]\n");
+            log_puts("[DEBUG fat12: disk_read_lba aborted, sectors_remaining=");
+            log_puti(count);
+            log_puts("]\n");
             return -1;
         }
         lba++;
@@ -177,9 +156,9 @@ static int disk_write_lba(uint32_t lba, uint16_t count, uint32_t buf_phys){
     while(count){
         if(disk_xfer_one(1, lba, buf_phys)){
             /* DEBUG: propagate exactly where in a multi-sector write it broke */
-            term_puts("[DEBUG fat12: disk_write_lba aborted, sectors_remaining=");
-            term_puti(count);
-            term_puts("]\n");
+            log_puts("[DEBUG fat12: disk_write_lba aborted, sectors_remaining=");
+            log_puti(count);
+            log_puts("]\n");
             return -1;
         }
         lba++;
@@ -214,30 +193,30 @@ static uint16_t fat12_alloc(void){
     }
     /* DEBUG: FAT is completely full -- worth knowing loudly, since a
      * silent 0 return here just looks like "save failed" otherwise. */
-    term_puts("[DEBUG fat12: fat12_alloc FAILED -- no free clusters left, disk is full]\n");
+    log_puts("[DEBUG fat12: fat12_alloc FAILED -- no free clusters left, disk is full]\n");
     return 0;
 }
 
 static int fat_flush(void){
-    term_puts("[DEBUG fat12: fat_flush -- writing FAT1+FAT2]\n");
+    log_puts("[DEBUG fat12: fat_flush -- writing FAT1+FAT2]\n");
     uint32_t phys = (uint32_t)(uintptr_t)fat_buf;
     if(disk_write_lba(FAT1_LBA, FAT_SECS, phys)){
-        term_puts("[DEBUG fat12: fat_flush FAILED writing FAT1]\n");
+        log_puts("[DEBUG fat12: fat_flush FAILED writing FAT1]\n");
         return -1;
     }
     if(disk_write_lba(FAT2_LBA, FAT_SECS, phys)){
-        term_puts("[DEBUG fat12: fat_flush FAILED writing FAT2]\n");
+        log_puts("[DEBUG fat12: fat_flush FAILED writing FAT2]\n");
         return -1;
     }
-    term_puts("[DEBUG fat12: fat_flush ok]\n");
+    log_puts("[DEBUG fat12: fat_flush ok]\n");
     return 0;
 }
 
 static int root_flush(void){
-    term_puts("[DEBUG fat12: root_flush -- writing root directory]\n");
+    log_puts("[DEBUG fat12: root_flush -- writing root directory]\n");
     int st = disk_write_lba(ROOT_LBA, ROOT_SECS, (uint32_t)(uintptr_t)root_buf);
-    if(st) term_puts("[DEBUG fat12: root_flush FAILED]\n");
-    else   term_puts("[DEBUG fat12: root_flush ok]\n");
+    if(st) log_puts("[DEBUG fat12: root_flush FAILED]\n");
+    else   log_puts("[DEBUG fat12: root_flush ok]\n");
     return st;
 }
 
@@ -264,22 +243,22 @@ static uint8_t *root_alloc_slot(void){
         if(!p[0] || p[0] == 0xE5) return p;
     }
     /* DEBUG: root directory is completely full (224 entries used up) */
-    term_puts("[DEBUG fat12: root_alloc_slot FAILED -- root directory full]\n");
+    log_puts("[DEBUG fat12: root_alloc_slot FAILED -- root directory full]\n");
     return 0;
 }
 
 static int fat_cache_load(void){
-    term_puts("[DEBUG fat12: fat_cache_load -- reading FAT + root directory into RAM]\n");
+    log_puts("[DEBUG fat12: fat_cache_load -- reading FAT + root directory into RAM]\n");
     if(disk_read_lba(FAT1_LBA, FAT_SECS, (uint32_t)(uintptr_t)fat_buf)){
-        term_puts("[DEBUG fat12: fat_cache_load FAILED reading FAT table]\n");
+        log_puts("[DEBUG fat12: fat_cache_load FAILED reading FAT table]\n");
         return -1;
     }
     if(disk_read_lba(ROOT_LBA, ROOT_SECS, (uint32_t)(uintptr_t)root_buf)){
-        term_puts("[DEBUG fat12: fat_cache_load FAILED reading root directory]\n");
+        log_puts("[DEBUG fat12: fat_cache_load FAILED reading root directory]\n");
         return -1;
     }
     fat_loaded = 1;
-    term_puts("[DEBUG fat12: fat_cache_load ok, filesystem is ready]\n");
+    log_puts("[DEBUG fat12: fat_cache_load ok, filesystem is ready]\n");
     return 0;
 }
 
@@ -288,17 +267,17 @@ void fat_init(uint8_t drive){
      * boot will print this exactly once, right before disk I/O
      * starts. If this never prints, the hang is before fat_init() is
      * even called (i.e. in kernel_main() itself, before this call). */
-    term_puts("[DEBUG fat12: fat_init ENTER drive=0x");
-    dbg_hex8(drive);
-    term_puts("]\n");
+    log_puts("[DEBUG fat12: fat_init ENTER drive=0x");
+    log_hex8(drive);
+    log_puts("]\n");
 
     fat_loaded = 0;
     disk_init_backend(drive);
     if(fat_cache_load()){
-        term_puts("[DEBUG fat12: fat_init FAILED -- filesystem will be unavailable]\n");
+        log_puts("[DEBUG fat12: fat_init FAILED -- filesystem will be unavailable]\n");
         return;
     }
-    term_puts("[DEBUG fat12: fat_init EXIT ok]\n");
+    log_puts("[DEBUG fat12: fat_init EXIT ok]\n");
 }
 
 int fat_ready(void){
@@ -306,16 +285,16 @@ int fat_ready(void){
 }
 
 int fat_load(const char *name11, void *buf, int len){
-    term_puts("[DEBUG fat12: fat_load ENTER]\n");
+    log_puts("[DEBUG fat12: fat_load ENTER]\n");
 
     if(!fat_loaded){
-        term_puts("[DEBUG fat12: fat_load FAILED -- filesystem not ready]\n");
+        log_puts("[DEBUG fat12: fat_load FAILED -- filesystem not ready]\n");
         return -1;
     }
 
     uint8_t *e = root_find(name11);
     if(!e){
-        term_puts("[DEBUG fat12: fat_load FAILED -- file not found]\n");
+        log_puts("[DEBUG fat12: fat_load FAILED -- file not found]\n");
         return -1;
     }
 
@@ -333,18 +312,18 @@ int fat_load(const char *name11, void *buf, int len){
 
         if(take == SECTOR_SZ){
             if(disk_read_lba(lba, 1, (uint32_t)(uintptr_t)dst)){
-                term_puts("[DEBUG fat12: fat_load FAILED mid-file at cluster ");
-                term_puti(clus);
-                term_puts("]\n");
+                log_puts("[DEBUG fat12: fat_load FAILED mid-file at cluster ");
+                log_puti(clus);
+                log_puts("]\n");
                 return -1;
             }
             dst += SECTOR_SZ;
             left -= SECTOR_SZ;
         } else {
             if(disk_read_lba(lba, 1, (uint32_t)(uintptr_t)io_buf)){
-                term_puts("[DEBUG fat12: fat_load FAILED on final partial sector, cluster ");
-                term_puti(clus);
-                term_puts("]\n");
+                log_puts("[DEBUG fat12: fat_load FAILED on final partial sector, cluster ");
+                log_puti(clus);
+                log_puts("]\n");
                 return -1;
             }
             for(int i=0;i<take;i++) dst[i] = io_buf[i];
@@ -354,19 +333,19 @@ int fat_load(const char *name11, void *buf, int len){
         clus = fat12_get(clus);
     }
 
-    term_puts("[DEBUG fat12: fat_load EXIT ok, bytes=");
-    term_puti(len - left);
-    term_puts("]\n");
+    log_puts("[DEBUG fat12: fat_load EXIT ok, bytes=");
+    log_puti(len - left);
+    log_puts("]\n");
     return len - left;
 }
 
 int fat_save(const char *name11, const void *buf, int len){
-    term_puts("[DEBUG fat12: fat_save ENTER len=");
-    term_puti(len);
-    term_puts("]\n");
+    log_puts("[DEBUG fat12: fat_save ENTER len=");
+    log_puti(len);
+    log_puts("]\n");
 
     if(!fat_loaded){
-        term_puts("[DEBUG fat12: fat_save FAILED -- filesystem not ready]\n");
+        log_puts("[DEBUG fat12: fat_save FAILED -- filesystem not ready]\n");
         return -1;
     }
 
@@ -381,7 +360,7 @@ int fat_save(const char *name11, const void *buf, int len){
     } else {
         e = root_alloc_slot();
         if(!e){
-            term_puts("[DEBUG fat12: fat_save FAILED -- could not allocate directory entry]\n");
+            log_puts("[DEBUG fat12: fat_save FAILED -- could not allocate directory entry]\n");
             return -1;
         }
         for(int i=0;i<32;i++) e[i] = 0;
@@ -396,7 +375,7 @@ int fat_save(const char *name11, const void *buf, int len){
     while(left > 0){
         uint16_t c = fat12_alloc();
         if(!c){
-            term_puts("[DEBUG fat12: fat_save FAILED -- disk full mid-write]\n");
+            log_puts("[DEBUG fat12: fat_save FAILED -- disk full mid-write]\n");
             return -1;
         }
 
@@ -409,16 +388,16 @@ int fat_save(const char *name11, const void *buf, int len){
         if(take < SECTOR_SZ){
             for(int i=0;i<SECTOR_SZ;i++) io_buf[i] = (i < take) ? src[i] : 0;
             if(disk_write_lba(clus_to_lba(c), 1, (uint32_t)(uintptr_t)io_buf)){
-                term_puts("[DEBUG fat12: fat_save FAILED writing final partial sector, cluster ");
-                term_puti(c);
-                term_puts("]\n");
+                log_puts("[DEBUG fat12: fat_save FAILED writing final partial sector, cluster ");
+                log_puti(c);
+                log_puts("]\n");
                 return -1;
             }
         } else {
             if(disk_write_lba(clus_to_lba(c), 1, (uint32_t)(uintptr_t)src)){
-                term_puts("[DEBUG fat12: fat_save FAILED writing cluster ");
-                term_puti(c);
-                term_puts("]\n");
+                log_puts("[DEBUG fat12: fat_save FAILED writing cluster ");
+                log_puti(c);
+                log_puts("]\n");
                 return -1;
             }
         }
@@ -431,21 +410,21 @@ int fat_save(const char *name11, const void *buf, int len){
     *(uint32_t *)(e + 28) = (uint32_t)len;
 
     if(fat_flush()){
-        term_puts("[DEBUG fat12: fat_save FAILED -- could not flush FAT table]\n");
+        log_puts("[DEBUG fat12: fat_save FAILED -- could not flush FAT table]\n");
         return -1;
     }
     if(root_flush()){
-        term_puts("[DEBUG fat12: fat_save FAILED -- could not flush root directory]\n");
+        log_puts("[DEBUG fat12: fat_save FAILED -- could not flush root directory]\n");
         return -1;
     }
 
-    term_puts("[DEBUG fat12: fat_save EXIT ok]\n");
+    log_puts("[DEBUG fat12: fat_save EXIT ok]\n");
     return 0;
 }
 
 void fat_dir(void (*cb)(const char *name11, uint32_t size)){
     if(!fat_loaded){
-        term_puts("[DEBUG fat12: fat_dir called but filesystem not ready]\n");
+        log_puts("[DEBUG fat12: fat_dir called but filesystem not ready]\n");
         return;
     }
 

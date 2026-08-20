@@ -39,4 +39,7 @@ void kpanic(const char *msg);
 /* BASIC interpreter entry point */
 void basic_run(void);
 
+int prog_load_name11(const char nm11[12]);
+extern int running;
+
 #endif
