@@ -1,9 +1,11 @@
 /* usb_msd.c — USB mass storage: Bulk-Only Transport + a small SCSI
    subset, on top of ehci bulk transfers. Polled and synchronous like
    the rest of the stack. Surfaces one-sector read/write for fat12's
-   disk backend. Scope: BOT only (protocol 0x50), LUN 0, 512-byte
-   blocks. Every message here is a single packet, so the endpoint data
-   toggle flips exactly once per successful transfer. */
+   disk backend. Scope: BOT only (protocol 0x50), 512-byte blocks.
+   Every message here is a single packet, so the endpoint data toggle
+   flips exactly once per successful transfer.
+   DMA buffers are 4KB-aligned: real ICH8/9 silicon is strict about
+   page-aligned qTD buffer lists for IN transfers, QEMU is not. */
 #include "usb_msd.h"
 #include "usb.h"
 #include "ehci.h"
@@ -30,16 +32,16 @@ typedef struct __attribute__((packed)) {
     uint8_t  status;
 } Csw;   /* 13 bytes */
 
-static uint8_t  g_addr, g_ep_in, g_ep_out;
+static uint8_t  g_addr, g_iface, g_ep_in, g_ep_out;
 static uint16_t g_pkt_in, g_pkt_out;
 static uint8_t  g_tog_in, g_tog_out;
 static uint32_t g_tag;
 static int      g_ready;
 static uint32_t g_blocks, g_blksz;
 
-static Cbw cbw __attribute__((aligned(32)));
-static Csw csw __attribute__((aligned(32)));
-static uint8_t scsi_buf[512] __attribute__((aligned(64)));
+static Cbw cbw __attribute__((aligned(4096)));
+static Csw csw __attribute__((aligned(4096)));
+static uint8_t scsi_buf[512] __attribute__((aligned(4096)));
 
 static int msd_bulk(int in, void *data, uint16_t len){
     if(!len) return 0;
@@ -59,9 +61,24 @@ static int msd_clear_stall(int in){
     return 0;
 }
 
+/* bulk-only mass storage reset: class request FF to the interface,
+   then clear halts + toggles on both bulk endpoints. */
+static int bot_reset(void){
+    uint8_t setup[8] = { 0x21, 0xFF, 0x00, 0x00, g_iface, 0x00, 0x00, 0x00 };
+    if(ehci_control(g_addr, setup, 0, 0)){
+        log_puts("usb: bot reset request failed\r\n");
+        return -1;
+    }
+    msd_clear_stall(0);
+    msd_clear_stall(1);
+    return 0;
+}
+
 /* one BOT command: CBW out, optional data phase, CSW in.
    returns the CSW status (0 ok, 1 check condition, 2 phase error),
-   or -1 on transport failure. */
+   or -1 on transport failure. a short or stalled data phase is a
+   hard failure, but only after the CSW has been read so the pipe
+   stays in sync. */
 static int bot_raw(int in, const uint8_t *cdb, uint8_t clen, void *data, uint32_t dlen){
     cbw.sig   = CBW_SIG;
     cbw.tag   = ++g_tag;
@@ -72,17 +89,20 @@ static int bot_raw(int in, const uint8_t *cdb, uint8_t clen, void *data, uint32_
     for(int i = 0; i < 16; i++) cbw.cb[i] = i < clen ? cdb[i] : 0;
 
     if(msd_bulk(0, &cbw, 31) != 31){
-        log_puts("usb: CBW failed\r\n");
+        log_puts("usb: CBW failed, attempting bot reset\r\n");
+        bot_reset();
         return -1;
     }
+    int shortfall = 0;
     if(dlen){
         int n = msd_bulk(in, data, (uint16_t)dlen);
         if(n < 0){
             log_puts("usb: data phase stalled, clearing halt\r\n");
             if(msd_clear_stall(in)) return -1;
-            /* the device still owes us a CSW */
+            shortfall = 1;
         } else if((uint32_t)n != dlen){
             log_puts("usb: short data phase\r\n");
+            shortfall = 1;
         }
     }
     int n = msd_bulk(1, &csw, 13);
@@ -96,6 +116,7 @@ static int bot_raw(int in, const uint8_t *cdb, uint8_t clen, void *data, uint32_
         log_puts("usb: bad CSW\r\n");
         return -1;
     }
+    if(shortfall) return -1;
     return csw.status;
 }
 
@@ -105,7 +126,7 @@ static int bot_cmd(int in, const uint8_t *cdb, uint8_t clen, void *data, uint32_
     int st = bot_raw(in, cdb, clen, data, dlen);
     if(st == 1){
         static const uint8_t rs[6] = { 0x03, 0, 0, 0, 18, 0 };
-        uint8_t sense[18];
+        uint8_t sense[18] __attribute__((aligned(4096)));
         bot_raw(1, rs, 6, sense, 18);
         return -1;
     }
@@ -171,9 +192,11 @@ static int scsi_rw(int write, uint32_t lba, void *buf){
     return bot_cmd(!write, cdb, 10, buf, 512);
 }
 
-int usb_msd_init(uint8_t addr, uint8_t ep_in, uint16_t pkt_in,
+int usb_msd_init(uint8_t addr, uint8_t iface,
+                 uint8_t ep_in, uint16_t pkt_in,
                  uint8_t ep_out, uint16_t pkt_out){
-    g_addr = addr; g_ep_in = ep_in; g_ep_out = ep_out;
+    g_addr = addr; g_iface = iface;
+    g_ep_in = ep_in; g_ep_out = ep_out;
     g_pkt_in = pkt_in; g_pkt_out = pkt_out;
     g_tog_in = g_tog_out = 0;
     g_ready = 0;

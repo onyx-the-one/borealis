@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>BTBX — Bare Tiny(?) BASIC eXecutor</title>
+<title>BOREALIS</title>
 <style>
   body { background:#000; color:#0f0; font-family:monospace; margin:0; padding:16px; }
   #screen_container {
@@ -22,10 +22,9 @@
 </style>
 </head>
 <body>
-<h2>NOTICE: THIS PROJECT IS IN THE PROCESS OF BEING RENAMED (TO BOREALIS)</h2>
-<p>BTBX — Bare Tiny(?) BASIC eXecutor. Requires JavaScript and XHR allowed for 3rd parties.<br>
+<p>BOREALIS. Requires JavaScript and XHR allowed for 3rd parties.<br>
 This demo is beta. Reviewers please use make && make run as specified in README.md. <br>
-Source: <a href="https://github.com/onyx-the-one/BTBX" target="_blank" rel="noopener">github.com/onyx-the-one/BTBX</a></p>
+Source: <a href="https://github.com/onyx-the-one/borealis" target="_blank" rel="noopener">github.com/onyx-the-one/borealis</a></p>
 
 <p id="status">Loading…</p>
 
@@ -59,7 +58,7 @@ window.onload = function () {
       url: "https://cdn.jsdelivr.net/gh/copy/v86@master/bios/vgabios.bin",
     },
     hda: {
-      url: "btbx.img",
+      url: "borealis.img",
     },
     autostart: true,
   });
@@ -78,11 +77,6 @@ window.onload = function () {
     if (screen.contains(e.target) || e.target === screen) refocus();
   });
 
-  // Full physical key -> PS/2 Set 1 make-code map. We own ALL keyboard
-  // input now (disable_keyboard:true), so every keydown/keyup is sent
-  // as a raw scancode, exactly like a real PS/2 keyboard. This avoids
-  // any double-handling between the browser's own key-repeat/composition
-  // logic and v86's built-in keyboard listener.
   var code_scancodes = {
     'Digit1': 0x02, 'Digit2': 0x03, 'Digit3': 0x04, 'Digit4': 0x05,
     'Digit5': 0x06, 'Digit6': 0x07, 'Digit7': 0x08, 'Digit8': 0x09,

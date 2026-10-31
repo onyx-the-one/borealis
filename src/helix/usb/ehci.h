@@ -63,7 +63,13 @@ typedef struct {
 } EhciTD;
 
 int ehci_probe(void);
-int ehci_device_present(void);
+
+int ehci_port_count(void);
+/* reset one port; returns 1 if a high-speed device came up enabled.
+   gates on PED (the actual port state), never on PEDC (a status bit
+   any other reader can ack out from under us -- the bios smm handler
+   on the laptop does exactly that). */
+int ehci_port_reset(uint8_t p);
 
 /* synchronous EP0 control transfer at the given device address.
    setup is the 8-byte setup packet; data/len describe the data stage

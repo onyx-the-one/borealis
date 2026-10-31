@@ -40,4 +40,8 @@ static inline void mdelay(uint32_t ms){
     }
 }
 
+void timer_init(void);
+uint32_t timer_get_ticks(void);
+void sleep_ticks(uint32_t ticks);
+
 #endif

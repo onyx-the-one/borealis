@@ -1,13 +1,12 @@
 /* ehci.c — EHCI host controller driver. Polled, async-schedule only.
-   Stage 1: PCI find, BIOS/SMM ownership handoff, reset, idle schedule,
-   port scan. Stage 2: transfer engine — one static QH plus a qTD pool
-   linked into the async ring per transfer, reclaimed with the IAA
-   doorbell; synchronous EP0 control. Stage 3: bulk transfers for the
-   mass-storage layer. No interrupts, no periodic schedule (mass storage
-   needs neither).
+   PCI find, BIOS/SMM ownership handoff, reset, idle async schedule,
+   per-port reset, synchronous control + bulk transfers. No interrupts,
+   no periodic schedule (mass storage needs neither).
    Delays are PIT-based (timer.h): the port-0x80 loop ran fast on real
-   LPC hardware, which made the 50 ms port-reset hold nominal-only and
-   cost the laptop its device detection.
+   LPC hardware, which made the 50 ms port-reset hold nominal-only.
+   Port reset gates on PED, not PEDC: on the laptop the PEDC status bit
+   never reached us (something else acks it -- the bios SMM handler is
+   the suspect), while PED itself read back set. 0x1005 doesn't lie.
    Memory model: helix runs identity-mapped, so &static == physical. */
 #include "ehci.h"
 #include "pci.h"
@@ -20,7 +19,6 @@ static inline void barrier(void){ __asm__ __volatile__("" ::: "memory"); }
 static volatile uint8_t *cap, *op;
 static uint8_t nports, ppc, eecp;
 static int g_up;            /* probe completed, schedule running */
-static int g_dev_port = -1; /* first port that came up high-speed */
 
 static uint32_t op_r(uint32_t r){ return *(volatile uint32_t *)(op + r); }
 static void op_w(uint32_t r, uint32_t v){ *(volatile uint32_t *)(op + r) = v; }
@@ -47,8 +45,13 @@ static int op_wait(uint32_t reg, uint32_t mask, uint32_t want, uint32_t ms){
 static EhciQH async_head __attribute__((aligned(32)));
 static EhciQH xfer_qh    __attribute__((aligned(32)));
 static EhciTD tds[TD_POOL] __attribute__((aligned(32)));
-static uint8_t setup_buf[8] __attribute__((aligned(32)));
+static uint8_t setup_buf[8] __attribute__((aligned(4096)));
 
+/* Fill a qTD's buffer list. DMA buffers are 4KB-aligned, so the start
+   offset in buf[0] is 0 and every pointer is a clean page -- this is
+   the layout real ICH8/9 silicon is strict about for IN transfers and
+   QEMU's model is not. For a buffer that still spans pages, buf[1..]
+   get the subsequent aligned pages. */
 static void td_fill(EhciTD *td, uint32_t next, uint8_t pid, uint8_t dt,
                     const void *buf, uint16_t len, int ioc){
     td->next = next;
@@ -60,18 +63,19 @@ static void td_fill(EhciTD *td, uint32_t next, uint8_t pid, uint8_t dt,
         for(int i = 0; i < 5; i++) td->buf[i] = 0;
         return;
     }
-    /* successive 4KB pages; buf[0] carries the start offset */
     uint32_t p = (uint32_t)(uintptr_t)buf;
     for(int i = 0; i < 5; i++){
         td->buf[i] = p & 0xFFFFF000u;
         p = (p & 0xFFFFF000u) + 0x1000;
     }
-    td->buf[0] |= (uint32_t)(uintptr_t)buf & 0xFFF;
+    td->buf[0] |= (uint32_t)(uintptr_t)buf & 0xFFF; /* 0 for aligned bufs */
 }
 
 /* run the QH's td chain: link into the async ring after the head,
    poll for completion, unlink, ring the doorbell so the controller
-   forgets the QH before we reuse it. */
+   forgets the QH before we reuse it. a halted td kills the whole
+   queue, so stop polling the moment any td shows an error bit --
+   the survivors will never run. */
 static int qh_run(int last_td){
     xfer_qh.hlp = async_head.hlp;
     barrier();
@@ -80,10 +84,13 @@ static int qh_run(int last_td){
 
     uint32_t t = 0;
     while(t < 1000){
-        int active = 0;
-        for(int i = 0; i <= last_td; i++)
-            if(tds[i].token & TD_ACTIVE){ active = 1; break; }
-        if(!active) break;
+        int active = 0, dead = 0;
+        for(int i = 0; i <= last_td; i++){
+            uint32_t tok = tds[i].token;
+            if(tok & TD_ACTIVE)   active = 1;
+            if(tok & TD_ERR_MASK) dead = 1;
+        }
+        if(!active || dead) break;
         mdelay(1);
         t++;
     }
@@ -97,7 +104,10 @@ static int qh_run(int last_td){
         uint32_t tok = tds[i].token;
         if(tok & TD_ERR_MASK){
             log_puts("ehci: td"); log_puti(i);
-            log_puts(" error token=0x"); log_hex32(tok); log_puts("\r\n");
+            log_puts(" error token=0x"); log_hex32(tok);
+            log_puts(" next=0x"); log_hex32(tds[i].next);
+            log_puts(" qh ep1=0x"); log_hex32(xfer_qh.ep1);
+            log_puts("\r\n");
             rc = -1;
         }
     }
@@ -167,8 +177,6 @@ int ehci_bulk(uint8_t addr, uint8_t ep, uint16_t maxpkt, int dir_in,
     return (int)(len - resid);
 }
 
-int ehci_device_present(void){ return g_dev_port >= 0; }
-
 /* ── probe / init ────────────────────────────────────────────────── */
 
 /* Take the controller away from SMM legacy USB. This is the layer the
@@ -196,48 +204,51 @@ static void ehci_handoff(uint8_t bus, uint8_t dev, uint8_t fn){
     }
     if(!owned) log_puts("ehci: WARNING bios semaphore never released, continuing anyway\r\n");
     pci_write32(bus, dev, fn, eecp + 4, 0); /* kill every legacy SMI source */
-    log_puts("ehci: ownership taken, smi enables cleared\r\n");
+    /* readback: status events live in the low word (R/WC, harmless);
+       the high word is the SMI enables and must read back zero */
+    uint32_t ctl = pci_read32(bus, dev, fn, eecp + 4);
+    log_puts("ehci: ownership taken, legctlsts=0x"); log_hex32(ctl); log_puts("\r\n");
+    if(ctl & 0xFFFF0000u)
+        log_puts("ehci: WARNING smi enables still set -- bios is still in the loop\r\n");
 }
 
-static void ehci_ports(void){
-    for(uint8_t p = 0; p < nports; p++){
-        uint32_t r = EHCI_PORTSC(p);
-        if(ppc){
-            op_w(r, (op_r(r) & ~PORTSC_RWC) | PORTSC_PP);
-            mdelay(100); /* power-good settle, real ms */
-        }
-        uint32_t v = op_r(r);
-        log_puts("ehci: port "); log_puti(p); log_puts(" sc=0x"); log_hex32(v);
-        if(!(v & PORTSC_CCS)){
-            log_puts(" empty\r\n");
+int ehci_port_count(void){ return nports; }
+
+int ehci_port_reset(uint8_t p){
+    if(p >= nports) return 0;
+    uint32_t r = EHCI_PORTSC(p);
+    if(ppc){
+        op_w(r, (op_r(r) & ~PORTSC_RWC) | PORTSC_PP);
+        mdelay(100); /* power-good settle, real ms */
+    }
+    uint32_t v = op_r(r);
+    log_puts("ehci: port "); log_puti(p); log_puts(" sc=0x"); log_hex32(v);
+    if(!(v & PORTSC_CCS)){
+        log_puts(" empty\r\n");
+        return 0;
+    }
+    for(int attempt = 0; attempt < 2; attempt++){
+        if(attempt) mdelay(500);
+        v = op_r(r);
+        op_w(r, (v & ~PORTSC_RWC) | PORTSC_CSC);   /* ack connect change */
+        v = op_r(r);
+        op_w(r, (v & ~PORTSC_RWC) | PORTSC_PR);    /* assert reset */
+        mdelay(50);                                 /* real 50 ms */
+        v = op_r(r);
+        op_w(r, v & ~PORTSC_RWC & ~PORTSC_PR);     /* deassert */
+        /* gate on PED: it is the actual port state and cannot be acked
+           away by a third party, unlike PEDC */
+        if(op_wait(r, PORTSC_PED, PORTSC_PED, 1000)){
+            log_puts(" reset-timeout sc=0x"); log_hex32(op_r(r));
             continue;
         }
-        int ok = 0;
-        for(int attempt = 0; attempt < 2 && !ok; attempt++){
-            if(attempt) mdelay(500);
-            v = op_r(r);
-            op_w(r, (v & ~PORTSC_RWC) | PORTSC_CSC);   /* ack connect change */
-            v = op_r(r);
-            op_w(r, (v & ~PORTSC_RWC) | PORTSC_PR);    /* assert reset */
-            mdelay(50);                                 /* real 50 ms */
-            v = op_r(r);
-            op_w(r, v & ~PORTSC_RWC & ~PORTSC_PR);     /* deassert */
-            if(op_wait(r, PORTSC_PEDC, PORTSC_PEDC, 1000)){
-                log_puts(" reset-timeout sc=0x"); log_hex32(op_r(r));
-                continue;
-            }
-            v = op_r(r);
-            op_w(r, (v & ~PORTSC_RWC) | PORTSC_PEDC);  /* ack enable change */
-            if(v & PORTSC_PED){
-                log_puts(" high-speed device");
-                if(g_dev_port < 0) g_dev_port = p;
-            } else {
-                log_puts(" full/low-speed, lost to companion controller");
-            }
-            ok = 1;
-        }
-        log_puts("\r\n");
+        v = op_r(r);
+        op_w(r, (v & ~PORTSC_RWC) | PORTSC_CSC | PORTSC_PEDC); /* ack both */
+        log_puts(" high-speed device\r\n");
+        return 1;
     }
+    log_puts("\r\n");
+    return 0;
 }
 
 int ehci_probe(void){
@@ -311,7 +322,6 @@ int ehci_probe(void){
 
     op_w(EHCI_CONFIGFLAG, 1);                                      /* route ports to ehci */
     mdelay(100);                                                   /* routing settle, real ms */
-    ehci_ports();
     g_up = 1;
     log_puts("ehci: probe done\r\n");
     return 0;

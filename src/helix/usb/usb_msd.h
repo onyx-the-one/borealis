@@ -2,7 +2,8 @@
 #define USB_MSD_H
 #include <stdint.h>
 
-int usb_msd_init(uint8_t addr, uint8_t ep_in, uint16_t pkt_in,
+int usb_msd_init(uint8_t addr, uint8_t iface,
+                 uint8_t ep_in, uint16_t pkt_in,
                  uint8_t ep_out, uint16_t pkt_out);
 int usb_msd_ready(void);
 

@@ -3,9 +3,8 @@
 #include "config.h"
 #include "log.h"
 #include "usb/usb.h"
-
-static inline void outb(uint16_t p,uint8_t v){__asm__ __volatile__("outb %0,%1"::"a"(v),"Nd"(p));}
-static inline uint8_t inb(uint16_t p){uint8_t v;__asm__ __volatile__("inb %1,%0":"=a"(v):"Nd"(p));return v;}
+#include "idt.h"
+#include "timer.h"
 
 /* ── VGA text terminal ────────────────────────────────────────────── */
 #define COLS 80
@@ -232,7 +231,7 @@ void draw_banner(void){
     term_clear();
     bannerrow("",VGA_BLACK,VGA_CYAN);
     bannerrow("BOREALIS",VGA_WHITE,VGA_BLUE);
-    bannerrow("x86-32 ver. 1.7.122-3r 29-07-2026",VGA_LIGHT_GREY,VGA_BLUE);
+    bannerrow("x86-32 ver. 1.8.0 31-10-2026",VGA_LIGHT_GREY,VGA_BLUE);
     bannerrow("",VGA_BLACK,VGA_CYAN);
     term_set_color(VGA_DARK_GREY,VGA_BLACK);
     for(int i=0;i<COLS;i++)term_putchar('-');
@@ -268,6 +267,9 @@ void kernel_main(uint8_t boot_drive){
     log_hex8(boot_drive);
     log_puts("]\n");
     term_set_color(VGA_LIGHT_GREY,VGA_BLACK);
+
+	idt_init();
+	timer_init();
 
     if(safety>1000){
         term_set_color(VGA_YELLOW,VGA_BLACK);

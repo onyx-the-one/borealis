@@ -20,7 +20,8 @@ src/helix/gfx/gfx.c \
 src/helix/usb/pci.c \
 src/helix/usb/ehci.c \
 src/helix/usb/usb.c \
-src/helix/usb/usb_msd.c
+src/helix/usb/usb_msd.c \
+src/helix/idt.c
 COBJS := $(CSRCS:.c=.o)
 ASMS := src/helix/entry.asm
 AOBJS := src/helix/entry.o
