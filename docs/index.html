@@ -1,135 +1,78 @@
 <!DOCTYPE html>
-<html lang="en">
+<html>
 <head>
 <meta charset="utf-8">
 <title>BOREALIS</title>
 <style>
-  body { background:#000; color:#0f0; font-family:monospace; margin:0; padding:16px; }
-  #screen_container {
-    white-space: pre;
-    font-size: 14px;
-    line-height: 14px;
-    outline: none;
-    display: inline-block;
-    border: 1px solid #0a0;
-    padding: 2px;
-    min-width: 640px;
-    min-height: 400px;
-    box-sizing: border-box;
-  }
-  a { color:#0ff; }
-  #status { color:#ff0; }
+body { background:#000; color:#ccc; font-family:monospace; max-width:700px; margin:20px auto; padding:0 10px; }
+a { color:#6cf; }
+pre { background:#111; padding:6px; overflow-x:auto; }
+img { max-width:100%; }
 </style>
 </head>
 <body>
-<p>BOREALIS. Requires JavaScript and XHR allowed for 3rd parties.<br>
-This demo is beta. Reviewers please use make && make run as specified in README.md. <br>
-Source: <a href="https://github.com/onyx-the-one/borealis" target="_blank" rel="noopener">github.com/onyx-the-one/borealis</a></p>
 
-<p id="status">Loading…</p>
+<h1>BOREALIS</h1>
 
-<div id="screen_container" tabindex="0">
-  <div style="white-space: pre; font: 14px monospace; line-height: 14px"></div>
-  <canvas style="display: none"></canvas>
-</div>
+<p>A from-scratch x86 operating system: bootloader (coil), kernel (helix), and a
+BASIC interpreter that is the shell. C and assembly, MIT licensed. Beta.</p>
 
-<script src="https://cdn.jsdelivr.net/npm/v86@0.5.44/build/libv86.js"></script>
-<script>
-"use strict";
-window.onload = function () {
-  var statusEl = document.getElementById("status");
-  var screen = document.getElementById("screen_container");
+<p><a href="https://github.com/onyx-the-one/borealis">source</a> |
+<a href="https://github.com/onyx-the-one/borealis/releases">releases</a></p>
 
-  if (typeof V86 === "undefined") {
-    statusEl.textContent = "Failed to load the v86 emulator script (libv86.js). Check JS/XHR blocking, adblockers, and try reloading.";
-    return;
-  }
+<img src="img1.png" alt="boot banner and prompt">
 
-  var emulator = new V86({
-    wasm_path: "https://cdn.jsdelivr.net/npm/v86@0.5.44/build/v86.wasm",
-    memory_size: 32 * 1024 * 1024,
-    vga_memory_size: 2 * 1024 * 1024,
-    screen_container: screen,
-    disable_keyboard: true,
-    bios: {
-      url: "https://cdn.jsdelivr.net/gh/copy/v86@master/bios/seabios.bin",
-    },
-    vga_bios: {
-      url: "https://cdn.jsdelivr.net/gh/copy/v86@master/bios/vgabios.bin",
-    },
-    fda: {
-      url: "borealis.img",
-    },
-    autostart: true,
-  });
+<h2>Run it</h2>
 
-  function refocus() {
-    screen.focus();
-    var canvas = screen.querySelector("canvas");
-    var inner = screen.querySelector("div");
-    if (canvas && typeof canvas.focus === "function") canvas.focus();
-    else if (inner && typeof inner.focus === "function") inner.focus();
-  }
+<p>QEMU is the supported way. There is no browser demo right now.</p>
 
-  screen.addEventListener("mousedown", function () { setTimeout(refocus, 0); });
-  screen.addEventListener("click", refocus);
-  window.addEventListener("click", function (e) {
-    if (screen.contains(e.target) || e.target === screen) refocus();
-  });
+<pre>git clone https://github.com/onyx-the-one/borealis
+cd borealis
+make
+make run</pre>
 
-  var code_scancodes = {
-    'Digit1': 0x02, 'Digit2': 0x03, 'Digit3': 0x04, 'Digit4': 0x05,
-    'Digit5': 0x06, 'Digit6': 0x07, 'Digit7': 0x08, 'Digit8': 0x09,
-    'Digit9': 0x0A, 'Digit0': 0x0B, 'Minus': 0x0C, 'Equal': 0x0D,
-    'BracketLeft': 0x1A, 'BracketRight': 0x1B, 'Backslash': 0x2B,
-    'Semicolon': 0x27, 'Quote': 0x28, 'Comma': 0x33, 'Period': 0x34,
-    'Slash': 0x35, 'Backquote': 0x29,
-    'KeyQ': 0x10, 'KeyW': 0x11, 'KeyE': 0x12, 'KeyR': 0x13, 'KeyT': 0x14,
-    'KeyY': 0x15, 'KeyU': 0x16, 'KeyI': 0x17, 'KeyO': 0x18, 'KeyP': 0x19,
-    'KeyA': 0x1E, 'KeyS': 0x1F, 'KeyD': 0x20, 'KeyF': 0x21, 'KeyG': 0x22,
-    'KeyH': 0x23, 'KeyJ': 0x24, 'KeyK': 0x25, 'KeyL': 0x26,
-    'KeyZ': 0x2C, 'KeyX': 0x2D, 'KeyC': 0x2E, 'KeyV': 0x2F, 'KeyB': 0x30,
-    'KeyN': 0x31, 'KeyM': 0x32,
-    'Space': 0x39, 'Enter': 0x1C, 'NumpadEnter': 0x1C, 'Backspace': 0x0E,
-    'Tab': 0x0F, 'Escape': 0x01,
-    'ShiftLeft': 0x2A, 'ShiftRight': 0x36,
-    'ControlLeft': 0x1D, 'AltLeft': 0x38, 'CapsLock': 0x3A,
-    'Numpad0': 0x52, 'Numpad1': 0x4F, 'Numpad2': 0x50, 'Numpad3': 0x51,
-    'Numpad4': 0x4B, 'Numpad5': 0x4C, 'Numpad6': 0x4D, 'Numpad7': 0x47,
-    'Numpad8': 0x48, 'Numpad9': 0x49, 'NumpadSubtract': 0x4A,
-    'NumpadAdd': 0x4E, 'NumpadDecimal': 0x53
-  };
+<p>Needs i686-elf-gcc, nasm, python3, qemu-system-i386 (mtools for make pack).
+make run asks for PulseAudio; without it, use:</p>
 
-  function inScreen() {
-    return document.activeElement === screen || screen.contains(document.activeElement);
-  }
+<pre>qemu-system-i386 -drive file=borealis.img,format=raw,if=floppy -boot a -m 4</pre>
 
-  document.addEventListener("keydown", function (e) {
-    if (!inScreen()) return;
-    var sc = code_scancodes[e.code];
-    if (sc === undefined) return;
-    e.preventDefault();
-    if (e.repeat) return;
-    emulator.keyboard_send_scancodes([sc]);
-  }, true);
+<h2>Try it</h2>
 
-  document.addEventListener("keyup", function (e) {
-    if (!inScreen()) return;
-    var sc = code_scancodes[e.code];
-    if (sc === undefined) return;
-    e.preventDefault();
-    emulator.keyboard_send_scancodes([sc | 0x80]);
-  }, true);
+<p>Type HELP. Numbered lines are stored as a program, anything else runs now.</p>
 
-  emulator.add_listener("emulator-ready", function () {
-    statusEl.textContent = "Running. (Click the screen above to interact)";
-    refocus();
-  });
+<pre>10 FOR I=1 TO 5
+20 PRINT I, I*I
+30 NEXT I
+RUN
+SAVE "SQUARES.BAS"
+NEW
+LOAD "SQUARES.BAS"
+LIST
+DIR
+BEEP 440,300
+EDIT</pre>
 
-  emulator.add_listener("emulator-loaded", function () {
-    statusEl.textContent = "Booting…";
-  });
-};
-</script>
+<pre>10 SCREEN 13
+20 FOR R=10 TO 90 STEP 10
+30 CIRCLE 160,100,R,R
+40 NEXT R
+50 DELAY 3000
+60 SCREEN 0
+RUN</pre>
+
+<img src="img2.png" alt="graphics mode">
+
+<h2>Doesn't work yet</h2>
+
+<ul>
+<li>Real hardware: boots to the banner on my laptop, then BIOS disk access hangs. Needs a native USB driver, which works in QEMU but not on the laptop yet.</li>
+<li>SAY (speech) is unfinished.</li>
+<li>demos/SNAKE.BAS doesn't run.</li>
+<li>POINT(x,y) is in HELP but not implemented.</li>
+<li>INKEY$ doesn't report arrow keys.</li>
+</ul>
+
+<p>coil/ is the bootloader, src/helix/ is the kernel and interpreter, demos/ has examples.</p>
+
 </body>
 </html>
